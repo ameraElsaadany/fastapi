@@ -1,31 +1,20 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 import pdfplumber
 import pandas as pd
 import re
-from pathlib import Path
+from werkzeug.utils import secure_filename
+import os
 
-app = FastAPI()
+app = Flask(__name__)
+CORS(app)
 
-# Setup CORS
-origins = [
-    "http://localhost",
-    "http://localhost:8080",
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-UPLOAD_FOLDER = Path('uploads')
+UPLOAD_FOLDER = 'uploads'
 ALLOWED_EXTENSIONS = {'pdf'}
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 
-def allowed_file(filename: str):
+def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
@@ -37,37 +26,39 @@ def extract_text_from_pdf(pdf_path):
     return text
 
 
-@app.post("/upload/")
-async def upload_and_process_pdf(file: UploadFile = File(...)):
-    if not allowed_file(file.filename):
-        raise HTTPException(status_code=400, detail="File type not allowed")
+@app.route('/upload', methods=['POST'])
+def upload_and_process_pdf():
+    if 'file' not in request.files:
+        return jsonify({'message': 'No file part'}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'message': 'No selected file'}), 400
+    if file and allowed_file(file.filename):
+        filename = secure_filename(file.filename)
+        pdf_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(pdf_path)
 
-    filename = Path(file.filename).name
-    pdf_path = UPLOAD_FOLDER / filename
+        text = extract_text_from_pdf(pdf_path)
 
-    with open(pdf_path, "wb") as buffer:
-        buffer.write(await file.read())
+        ner = re.compile(r'([A-Za-z].*?) (\d+\.\d{2} +|\d+\.\d{1} +|\d+|\s+)')
+        arr = {}
+        for line in text.split('\n'):
+            match = ner.match(line)
+            if match:
+                vand_name, vand_num = match.groups()
+                arr[vand_name.strip()] = vand_num
 
-    text = extract_text_from_pdf(pdf_path)
+        df = pd.DataFrame(list(arr.items()), columns=['Test', 'Result'])
+        keywords = ['Haemoglobin', 'Hemoglobin', 'Iron', 'Vitamin D', 'Vitamin B12']
+        filtered_df = df[df['Test'].str.contains('|'.join(keywords))]
 
-    ner = re.compile(r'([A-Za-z].*?) (\d+\.\d{2} +|\d+\.\d{1} +|\d+|\s+)')
-    arr = {}
-    for line in text.split('\n'):
-        match = ner.match(line)
-        if match:
-            vand_name, vand_num = match.groups()
-            arr[vand_name.strip()] = vand_num
-
-    df = pd.DataFrame(list(arr.items()), columns=['Test', 'Result'])
-    keywords = ['Haemoglobin', 'Hemoglobin', 'Iron', 'Vitamin D', 'Vitamin B12']
-    filtered_df = df[df['Test'].str.contains('|'.join(keywords))]
-
-    result_array = filtered_df.to_dict('records')
-    return result_array
+        result_array = filtered_df.to_dict('records')
+        return jsonify(result_array), 200
+    else:
+        return jsonify({'message': 'File type not allowed'}), 400
 
 
 if __name__ == '__main__':
-    if not UPLOAD_FOLDER.exists():
-        UPLOAD_FOLDER.mkdir(parents=True)
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    if not os.path.exists(UPLOAD_FOLDER):
+        os.makedirs(UPLOAD_FOLDER)
+    app.run(debug=True)
